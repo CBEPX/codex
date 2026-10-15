@@ -1,0 +1,124 @@
+name: Isolated lifecycle qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        type: choice
+        options: [features, residency, packages]
+        default: features
+      build:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_BUILD_JOBS: '2'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  RUST_MIN_STACK: '8388608'
+
+jobs:
+  tests:
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: codex-rs
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          targets: aarch64-apple-darwin
+      - name: Check runner resources
+        run: |
+          test "$(uname -m)" = arm64
+          df -h .
+          test "$(df -k . | tail -1 | awk '{print $4}')" -ge 8388608
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: lifecycle-tests-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: lifecycle-tests-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-
+      - uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: aarch64-apple-darwin
+      - name: Run selected tests
+        env:
+          SUITE: ${{ inputs.suite }}
+        run: |
+          set -euo pipefail
+          case "$SUITE" in
+            features) cargo test --locked --profile dev-small -p codex-features --lib 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
+            residency) cargo test --locked --profile dev-small -p codex-core --lib agent::control::residency_tests 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
+            packages) cargo test --locked --profile dev-small -p codex-features -p codex-core --lib 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
+          esac
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        if: always()
+        with:
+          name: lifecycle-test-log-${{ github.sha }}
+          path: ${{ runner.temp }}/tests.log
+          retention-days: 7
+  build:
+    if: inputs.build
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: codex-rs
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          targets: aarch64-apple-darwin
+      - name: Check runner resources
+        run: |
+          test "$(uname -m)" = arm64
+          df -h .
+          test "$(df -k . | tail -1 | awk '{print $4}')" -ge 8388608
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: lifecycle-build-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: lifecycle-build-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-
+      - uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: aarch64-apple-darwin
+      - name: Build test binaries
+        run: |
+          set -euo pipefail
+          export STABLE_GIT_COMMIT="$(git rev-parse HEAD)"
+          cargo build --locked --profile dev-small --target aarch64-apple-darwin --bin codex --bin codex-code-mode-host 2>&1 | tee "$RUNNER_TEMP/build.log"
+          mkdir -p "$RUNNER_TEMP/lifecycle-bin"
+          cp target/aarch64-apple-darwin/dev-small/{codex,codex-code-mode-host} "$RUNNER_TEMP/lifecycle-bin/"
+          git rev-parse HEAD > "$RUNNER_TEMP/lifecycle-bin/COMMIT"
+          cd "$RUNNER_TEMP/lifecycle-bin"
+          shasum -a 256 codex codex-code-mode-host > SHA256SUMS
+          ./codex --version
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: lifecycle-bin-${{ github.sha }}
+          path: ${{ runner.temp }}/lifecycle-bin/
+          retention-days: 7
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        if: always()
+        with:
+          name: lifecycle-build-log-${{ github.sha }}
+          path: ${{ runner.temp }}/build.log
+          retention-days: 7

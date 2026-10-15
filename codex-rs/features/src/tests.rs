@@ -741,6 +741,27 @@ multi_agent_v2 = true
 }
 
 #[test]
+fn multi_agent_v2_completed_agent_unload_delay_deserializes() {
+    for delay in [0, 2] {
+        let config: crate::MultiAgentV2ConfigToml =
+            toml::from_str(&format!("completed_agent_unload_delay_secs = {delay}"))
+                .expect("nonnegative unload delay should deserialize");
+        let serialized = toml::Value::try_from(config).expect("serialize feature config");
+        assert_eq!(
+            serialized["completed_agent_unload_delay_secs"].as_integer(),
+            Some(delay)
+        );
+    }
+    let default = toml::Value::try_from(crate::MultiAgentV2ConfigToml::default())
+        .expect("serialize default feature config");
+    assert!(default.get("completed_agent_unload_delay_secs").is_none());
+    assert!(
+        toml::from_str::<crate::MultiAgentV2ConfigToml>("completed_agent_unload_delay_secs = -1")
+            .is_err()
+    );
+}
+
+#[test]
 fn multi_agent_v2_feature_config_deserializes_table() {
     let features: FeaturesToml = toml::from_str(
         r#"
