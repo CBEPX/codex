@@ -1003,7 +1003,12 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
     check_v2_agent_reload(V2ReloadRoute::Sender).await;
 }
 
-struct CompletedAgentUnloadTask;
+#[derive(Clone, Copy)]
+enum CompletedAgentUnloadTask {
+    Completed,
+    Errored,
+    Interrupted,
+}
 
 impl crate::tasks::SessionTask for CompletedAgentUnloadTask {
     fn kind(&self) -> crate::state::TaskKind {
@@ -1021,8 +1026,49 @@ impl crate::tasks::SessionTask for CompletedAgentUnloadTask {
         _input: Vec<crate::session::TurnInput>,
         _cancellation_token: CancellationToken,
     ) -> crate::tasks::SessionTaskResult {
-        Ok(Some("completed child result".to_string()))
+        match self.as_ref() {
+            Self::Completed => Ok(Some("completed child result".to_string())),
+            Self::Errored => Err(CodexErr::Fatal("child failure".to_string())),
+            Self::Interrupted => Err(CodexErr::TurnAborted),
+        }
     }
+}
+
+#[tokio::test]
+async fn completed_agent_unload_excludes_direct_turn_input() {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (_, root) = harness.start_paginated_thread().await;
+    let control = root
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.session.session_id());
+    let child = spawn_v2_reload_test_child(&control, harness.config.clone(), &root, "worker").await;
+    let thread = harness
+        .manager
+        .get_thread(child.thread_id)
+        .await
+        .expect("loaded child");
+    let eviction_guard = Arc::clone(&thread.residency_gate).write_owned().await;
+    let mut input =
+        Box::pin(thread.start_or_steer_turn(TurnInputRequest::user_input(text_input("followup"))));
+    assert!(
+        timeout(Duration::from_millis(50), &mut input)
+            .await
+            .is_err(),
+        "turn input must wait for the residency gate"
+    );
+    drop(eviction_guard);
+    timeout(Duration::from_secs(10), input)
+        .await
+        .expect("input admission completes")
+        .expect("input accepted");
+    harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
 }
 
 #[tokio::test]
@@ -1088,11 +1134,18 @@ async fn completed_agent_unload_resume_waits_for_eviction_and_reloads() {
         .await;
 }
 
+#[test_case::test_case(CompletedAgentUnloadTask::Completed, 0; "completed_zero")]
+#[test_case::test_case(CompletedAgentUnloadTask::Completed, 2; "completed_delayed")]
+#[test_case::test_case(CompletedAgentUnloadTask::Errored, 0; "errored")]
+#[test_case::test_case(CompletedAgentUnloadTask::Interrupted, 0; "interrupted")]
 #[tokio::test]
-async fn completed_agent_unload_preserves_history_and_root() {
+async fn completed_agent_unload_preserves_history_and_root(
+    outcome: CompletedAgentUnloadTask,
+    delay: i64,
+) {
     let (home, mut config) = test_config_with_cli_overrides(vec![(
         "features.multi_agent_v2.completed_agent_unload_delay_secs".to_string(),
-        TomlValue::Integer(0),
+        TomlValue::Integer(delay),
     )])
     .await;
     let _ = config.features.enable(Feature::MultiAgentV2);
@@ -1117,10 +1170,12 @@ async fn completed_agent_unload_preserves_history_and_root() {
         .await
         .expect("persist child history");
     let turn = thread.session.new_default_turn().await;
-    thread
-        .session
-        .spawn_task(turn, Vec::new(), CompletedAgentUnloadTask)
-        .await;
+    thread.session.spawn_task(turn, Vec::new(), outcome).await;
+
+    if delay > 0 {
+        sleep(Duration::from_millis(100)).await;
+        assert!(harness.manager.get_thread(child.thread_id).await.is_ok());
+    }
 
     timeout(Duration::from_secs(10), async {
         while harness.manager.get_thread(child.thread_id).await.is_ok() {
@@ -1148,7 +1203,10 @@ async fn completed_agent_unload_preserves_history_and_root() {
         .expect("reloaded child");
     assert!(!Arc::ptr_eq(&thread, &reloaded));
     let history = reloaded.session.clone_history().await;
-    assert!(strip_response_item_ids(history.raw_items()).contains(&history_item));
+    assert!(
+        strip_response_item_ids(&history.raw_items().cloned().collect::<Vec<_>>())
+            .contains(&history_item)
+    );
     harness
         .manager
         .shutdown_all_threads_bounded(Duration::from_secs(10))

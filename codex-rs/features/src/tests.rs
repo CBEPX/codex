@@ -796,6 +796,7 @@ non_code_mode_only = true
         features.multi_agent_v2,
         Some(crate::FeatureToml::Config(crate::MultiAgentV2ConfigToml {
             enabled: Some(true),
+            completed_agent_unload_delay_secs: None,
             max_concurrent_threads_per_session: Some(4),
             min_wait_timeout_ms: Some(2500),
             max_wait_timeout_ms: Some(120000),

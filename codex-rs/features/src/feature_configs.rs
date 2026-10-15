@@ -289,6 +289,9 @@ where
 pub struct MultiAgentV2ConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Unload idle terminal children after this delay. Omit to disable automatic unload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_agent_unload_delay_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_concurrent_threads_per_session: Option<usize>,

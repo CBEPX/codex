@@ -55,7 +55,7 @@ jobs:
               return {(p['name'], p['version'], p['source'], p.get('checksum')) for p in packages if 'source' in p}
           assert external(sys.argv[1]) == external('Cargo.lock'), 'External dependency versions changed'
           PYTHON
-      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+      - uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
         with:
           path: |
             ~/.cargo/registry
@@ -73,7 +73,10 @@ jobs:
           set -euo pipefail
           case "$SUITE" in
             features) cargo test --locked --profile dev-small -p codex-features --lib 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
-            lifecycle) cargo test --locked --profile dev-small -p codex-core --lib completed_agent_unload 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
+            lifecycle)
+              cargo test --locked --profile dev-small -p codex-features --lib 2>&1 | tee "$RUNNER_TEMP/tests.log"
+              cargo test --locked --profile dev-small -p codex-core --lib completed_agent_unload 2>&1 | tee -a "$RUNNER_TEMP/tests.log"
+              ;;
             residency) cargo test --locked --profile dev-small -p codex-core --lib agent::control::residency_tests 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
             packages) cargo test --locked --profile dev-small -p codex-features -p codex-core --lib 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
           esac
@@ -83,6 +86,14 @@ jobs:
           name: lifecycle-test-log-${{ github.sha }}
           path: ${{ runner.temp }}/tests.log
           retention-days: 7
+      - uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        if: always() && !cancelled()
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: lifecycle-tests-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ github.run_id }}
   build:
     if: inputs.build
     runs-on: macos-15
@@ -116,7 +127,7 @@ jobs:
               return {(p['name'], p['version'], p['source'], p.get('checksum')) for p in packages if 'source' in p}
           assert external(sys.argv[1]) == external('Cargo.lock'), 'External dependency versions changed'
           PYTHON
-      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+      - uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
         with:
           path: |
             ~/.cargo/registry
@@ -150,3 +161,11 @@ jobs:
           name: lifecycle-build-log-${{ github.sha }}
           path: ${{ runner.temp }}/build.log
           retention-days: 7
+      - uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        if: always() && !cancelled()
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: lifecycle-build-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}-${{ github.run_id }}
