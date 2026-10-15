@@ -5,7 +5,7 @@ on:
     inputs:
       suite:
         type: choice
-        options: [features, residency, packages]
+        options: [features, lifecycle, residency, packages]
         default: features
       build:
         type: boolean
@@ -73,6 +73,7 @@ jobs:
           set -euo pipefail
           case "$SUITE" in
             features) cargo test --locked --profile dev-small -p codex-features --lib 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
+            lifecycle) cargo test --locked --profile dev-small -p codex-core --lib completed_agent_unload 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
             residency) cargo test --locked --profile dev-small -p codex-core --lib agent::control::residency_tests 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
             packages) cargo test --locked --profile dev-small -p codex-features -p codex-core --lib 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
           esac

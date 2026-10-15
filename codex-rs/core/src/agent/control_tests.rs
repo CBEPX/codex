@@ -1003,6 +1003,158 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
     check_v2_agent_reload(V2ReloadRoute::Sender).await;
 }
 
+struct CompletedAgentUnloadTask;
+
+impl crate::tasks::SessionTask for CompletedAgentUnloadTask {
+    fn kind(&self) -> crate::state::TaskKind {
+        crate::state::TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "completed_agent_unload_test"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<crate::session::session::Session>,
+        _ctx: Arc<crate::session::turn_context::TurnContext>,
+        _input: Vec<crate::session::TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> crate::tasks::SessionTaskResult {
+        Ok(Some("completed child result".to_string()))
+    }
+}
+
+#[tokio::test]
+async fn completed_agent_unload_resume_waits_for_eviction_and_reloads() {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let _ = config.features.enable(Feature::Sqlite);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (_, root) = harness.start_paginated_thread().await;
+    let control = root
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.session.session_id());
+    let child = spawn_v2_reload_test_child(&control, harness.config.clone(), &root, "worker").await;
+    let thread = harness
+        .manager
+        .get_thread(child.thread_id)
+        .await
+        .expect("loaded child");
+    thread
+        .inject_response_items(vec![assistant_message(
+            "persisted child",
+            Some(MessagePhase::FinalAnswer),
+        )])
+        .await
+        .expect("persist history");
+
+    // Hold the same exclusion gate as eviction while a resume observes the old runtime.
+    let eviction_guard = Arc::clone(&thread.residency_gate).write_owned().await;
+    let mut resume =
+        Box::pin(control.ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, None));
+    assert!(
+        timeout(Duration::from_millis(50), &mut resume)
+            .await
+            .is_err()
+    );
+    thread
+        .shutdown_and_wait()
+        .await
+        .expect("finish resident shutdown");
+    harness
+        .manager
+        .remove_thread(&child.thread_id)
+        .await
+        .expect("remove old runtime");
+    control.forget_v2_residency(child.thread_id);
+    drop(eviction_guard);
+
+    timeout(Duration::from_secs(10), resume)
+        .await
+        .expect("resume completes")
+        .expect("resume reloads after lost pin");
+    let reloaded = harness
+        .manager
+        .get_thread(child.thread_id)
+        .await
+        .expect("resume must publish a runtime");
+    assert!(!Arc::ptr_eq(&thread, &reloaded));
+    harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+}
+
+#[tokio::test]
+async fn completed_agent_unload_preserves_history_and_root() {
+    let (home, mut config) = test_config_with_cli_overrides(vec![(
+        "features.multi_agent_v2.completed_agent_unload_delay_secs".to_string(),
+        TomlValue::Integer(0),
+    )])
+    .await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let _ = config.features.enable(Feature::Sqlite);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 8;
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (root_id, root) = harness.start_paginated_thread().await;
+    let control = root
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.session.session_id());
+    let child = spawn_v2_reload_test_child(&control, harness.config.clone(), &root, "worker").await;
+    let thread = harness
+        .manager
+        .get_thread(child.thread_id)
+        .await
+        .expect("loaded child");
+    let history_item = assistant_message("history before unload", Some(MessagePhase::FinalAnswer));
+    thread
+        .inject_response_items(vec![history_item.clone()])
+        .await
+        .expect("persist child history");
+    let turn = thread.session.new_default_turn().await;
+    thread
+        .session
+        .spawn_task(turn, Vec::new(), CompletedAgentUnloadTask)
+        .await;
+
+    timeout(Duration::from_secs(10), async {
+        while harness.manager.get_thread(child.thread_id).await.is_ok() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("completed child should unload without capacity pressure");
+    assert!(harness.manager.get_thread(root_id).await.is_ok());
+    assert_matches!(
+        control
+            .inspect_agent(child.thread_id)
+            .await
+            .expect("known child"),
+        AgentInfo::Unloaded(_)
+    );
+    control
+        .ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, None)
+        .await
+        .expect("reload completed child");
+    let reloaded = harness
+        .manager
+        .get_thread(child.thread_id)
+        .await
+        .expect("reloaded child");
+    assert!(!Arc::ptr_eq(&thread, &reloaded));
+    let history = reloaded.session.clone_history().await;
+    assert!(strip_response_item_ids(history.raw_items()).contains(&history_item));
+    harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+}
+
 #[tokio::test]
 async fn ensure_v2_child_loaded_preserves_evicted_parent_authority() {
     check_v2_agent_reload(V2ReloadRoute::NestedParent).await;
