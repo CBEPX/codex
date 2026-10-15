@@ -77,9 +77,10 @@ jobs:
               cargo test --locked --profile dev-small -p codex-features --lib 2>&1 | tee "$RUNNER_TEMP/tests.log"
               cargo test --locked --profile dev-small -p codex-core --lib completed_agent_unload 2>&1 | tee -a "$RUNNER_TEMP/tests.log"
               ;;
-            residency) cargo test --locked --profile dev-small -p codex-core --lib agent::control::residency_tests 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
+            residency) cargo test --locked --profile dev-small -p codex-core --lib agent::control::residency::tests 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
             packages) cargo test --locked --profile dev-small -p codex-features -p codex-core --lib 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
           esac
+          python3 -c 'import re,sys; counts=re.findall(r"test result: ok\. (\d+) passed", open(sys.argv[1]).read()); assert counts and all(int(n)>0 for n in counts), "No tests selected"' "$RUNNER_TEMP/tests.log"
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         if: always()
         with:
