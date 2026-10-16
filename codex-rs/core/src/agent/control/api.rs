@@ -24,6 +24,7 @@ use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
@@ -107,14 +108,37 @@ impl AgentControl for LocalAgentControl {
                 mut start_options,
             } = request;
             let target = self.resolve_target(caller, &target)?;
+            let reload_after_eviction = resume_config
+                .multi_agent_v2
+                .completed_agent_unload_delay_secs
+                .is_some();
             let (metadata, submission_id) = match input {
                 AgentInput::UserInput(input) => {
                     let receiver = self.get_agent_metadata(target);
                     if receiver.is_some() {
-                        self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                            .await?;
+                        self.ensure_v2_agent_loaded(
+                            resume_config.clone(),
+                            target,
+                            /*parent*/ None,
+                        )
+                        .await?;
                     }
-                    let submission_id = self.send_input(target, input, start_options).await?;
+                    let result = self
+                        .send_input(target, input.clone(), start_options.clone())
+                        .await;
+                    // ThreadNotFound comes from the residency pin before submission.
+                    // Never replay a request that reached the session and then failed.
+                    let submission_id = if reload_after_eviction
+                        && receiver.is_some()
+                        && result.as_ref().is_err_and(|err| {
+                            matches!(err.details(), CodexErrorDetails::ThreadNotFound(_))
+                        }) {
+                        self.ensure_v2_agent_loaded(resume_config, target, None)
+                            .await?;
+                        self.send_input(target, input, start_options).await?
+                    } else {
+                        result?
+                    };
                     (receiver.unwrap_or_default(), submission_id)
                 }
                 AgentInput::Message { message, mode } => {
@@ -138,14 +162,17 @@ impl AgentControl for LocalAgentControl {
                     })?;
                     // Cold-restored children still reload lazily on any message. Only
                     // locally evicted recipients can retain mail without reloading.
-                    // Loaded recipients go straight to delivery, which rejects sends
-                    // racing an in-progress eviction when it acquires the residency pin.
+                    // Delivery acquires a residency pin before it accepts a message.
                     if mode == MessageDeliveryMode::TriggerTurn
                         || (self.runtime.upgrade()?.get_thread(target).await.is_err()
                             && self.runtime.registry.evicted_environments(target).is_none())
                     {
-                        self.ensure_v2_agent_loaded(resume_config, target, /*parent*/ None)
-                            .await?;
+                        self.ensure_v2_agent_loaded(
+                            resume_config.clone(),
+                            target,
+                            /*parent*/ None,
+                        )
+                        .await?;
                     }
                     let communication = message.into_communication(author, receiver_path, mode);
                     let kind = match mode {
@@ -155,14 +182,32 @@ impl AgentControl for LocalAgentControl {
                         }
                         MessageDeliveryMode::TriggerTurn => AgentCommunicationKind::Followup,
                     };
-                    let submission_id = self
+                    let result = self
                         .send_inter_agent_communication(
+                            target,
+                            communication.clone(),
+                            AgentCommunicationContext::new(kind, caller),
+                            start_options.clone(),
+                        )
+                        .await;
+                    let submission_id = if reload_after_eviction
+                        && result.as_ref().is_err_and(|err| {
+                            matches!(err.details(), CodexErrorDetails::ThreadNotFound(_))
+                        }) {
+                        if mode == MessageDeliveryMode::TriggerTurn {
+                            self.ensure_v2_agent_loaded(resume_config, target, None)
+                                .await?;
+                        }
+                        self.send_inter_agent_communication(
                             target,
                             communication,
                             AgentCommunicationContext::new(kind, caller),
                             start_options,
                         )
-                        .await?;
+                        .await?
+                    } else {
+                        result?
+                    };
                     (receiver, submission_id)
                 }
             };

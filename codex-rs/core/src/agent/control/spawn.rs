@@ -164,7 +164,7 @@ fn retain_forked_developer_message(item: &mut ResponseItem, usage_hint_texts: &[
     !content.is_empty() && set_annotated_content(item, content).is_some()
 }
 
-async fn load_agent_model_context(
+pub(super) async fn load_agent_model_context(
     state: &ThreadManagerState,
     thread_id: ThreadId,
     history_mode: ThreadHistoryMode,
@@ -347,8 +347,12 @@ impl LocalAgentControl {
                 )));
             }
         }
-        if owner_thread_id.is_none() && state.get_thread(thread_id).await.is_ok() {
-            self.touch_loaded_v2_residency(&state, thread_id).await;
+        if owner_thread_id.is_none()
+            && self
+                .touch_loaded_v2_residency(&state, thread_id)
+                .await
+                .is_ok()
+        {
             return Ok(());
         }
         if self
@@ -402,8 +406,13 @@ impl LocalAgentControl {
             }
             if let Ok(thread) = state.get_thread(thread_id).await {
                 self.validate_loaded_v2_child(&thread, parent_thread_id)?;
-                self.touch_loaded_v2_residency(&state, thread_id).await;
-                return Ok(());
+                if self
+                    .touch_loaded_v2_residency(&state, thread_id)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(());
+                }
             }
         }
         let parent = if let Some(parent) = parent {
@@ -663,8 +672,7 @@ impl LocalAgentControl {
                     }
                     self.runtime.registry.clear_evicted_environments(thread_id);
                     drop(residency_slot);
-                    self.touch_loaded_v2_residency(&state, thread_id).await;
-                    return Ok(());
+                    return self.touch_loaded_v2_residency(&state, thread_id).await;
                 }
                 Err(err)
             }
