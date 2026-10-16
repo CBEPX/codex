@@ -91,7 +91,8 @@ impl LocalAgentControl {
         thread_id: ThreadId,
     ) -> CodexResult<()> {
         let thread = state.get_thread(thread_id).await?;
-        self.runtime.pin_v2_residency(&thread).await?;
+        let _guard = self.runtime.pin_v2_residency(&thread).await?;
+        self.runtime.cancel_completed_agent_unload(thread_id);
         Ok(())
     }
 
@@ -481,9 +482,10 @@ impl V2Residency {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        touch_resident(&mut state.residents, thread_id);
-        if let Some(timer) = state.unload_timers.remove(&thread_id) {
-            timer.cancel();
+        // Initial input can pin a published runtime before its reserved slot commits.
+        // Only commit_slot inserts residents, so startup is counted exactly once.
+        if state.residents.contains(&thread_id) {
+            touch_resident(&mut state.residents, thread_id);
         }
     }
 

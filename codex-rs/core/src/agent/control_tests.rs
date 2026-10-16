@@ -1367,10 +1367,14 @@ async fn completed_agent_unload_excludes_direct_turn_input(settings: bool) {
         .await;
 }
 
-#[test_case::test_case(false; "resume")]
-#[test_case::test_case(true; "queue_only_caller_without_unload")]
+#[test_case::test_case(false, false; "resume")]
+#[test_case::test_case(true, false; "queue_only_caller_without_unload")]
+#[test_case::test_case(true, true; "terminal_result_during_teardown")]
 #[tokio::test]
-async fn completed_agent_unload_resume_waits_for_eviction_and_reloads(queue_only: bool) {
+async fn completed_agent_unload_resume_waits_for_eviction_and_reloads(
+    queue_only: bool,
+    terminal_result: bool,
+) {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
@@ -1402,7 +1406,26 @@ async fn completed_agent_unload_resume_waits_for_eviction_and_reloads(queue_only
     // Hold the same exclusion gate as eviction while a resume observes the old runtime.
     let eviction_guard = Arc::clone(&thread.residency_gate).write_owned().await;
     let mut resume = Box::pin(async {
-        if queue_only {
+        if terminal_result {
+            control
+                .send_inter_agent_communication(
+                    child.thread_id,
+                    InterAgentCommunication::new(
+                        AgentPath::root(),
+                        AgentPath::try_from("/root/worker").expect("agent path"),
+                        Vec::new(),
+                        "delivered once".into(),
+                        false,
+                    ),
+                    AgentCommunicationContext::new(
+                        AgentCommunicationKind::Result,
+                        root.session.thread_id,
+                    ),
+                    Default::default(),
+                )
+                .await
+                .map(|_| ())
+        } else if queue_only {
             control
                 .send(crate::SendRequest {
                     caller: root.session.thread_id,

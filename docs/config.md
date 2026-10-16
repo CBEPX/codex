@@ -34,7 +34,7 @@ Transient REPL variables, subscriptions, and server-side tasks do not survive.
 
 An active turn, durable sleep, trigger mail, background terminal, active code-mode
 cell, approval, or active descendant blocks unload. Codex retries a blocked unload
-once after five seconds, then keeps the runtime loaded. Resume or new work cancels
+once after five seconds, then keeps the runtime loaded. Resume or a new turn cancels
 the pending deadline. A later terminal turn can set a new deadline.
 
 Follow-up input waits for an unload in progress, then reloads the child from saved
