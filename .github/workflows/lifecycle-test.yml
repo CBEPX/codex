@@ -5,7 +5,7 @@ on:
     inputs:
       suite:
         type: choice
-        options: [features, lifecycle, residency, packages]
+        options: [features, lifecycle, residency, packages, format]
         default: features
       build:
         type: boolean
@@ -23,7 +23,18 @@ env:
   RUST_MIN_STACK: '8388608'
 
 jobs:
+  format:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+      - run: cargo fmt -- --config imports_granularity=Item --check
+        working-directory: codex-rs
   tests:
+    if: inputs.suite != 'format'
     runs-on: macos-15
     timeout-minutes: 90
     defaults:
