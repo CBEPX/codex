@@ -1044,6 +1044,7 @@ enum CompletedAgentUnloadBlocker {
     Sleep,
     Elicitation,
     CodeModeCell,
+    BackgroundTerminal,
     TriggerMail,
     ResumedTurn,
     ActiveDescendant,
@@ -1057,6 +1058,7 @@ enum CompletedAgentUnloadBlocker {
 #[test_case::test_case(CompletedAgentUnloadBlocker::Sleep; "durable_sleep")]
 #[test_case::test_case(CompletedAgentUnloadBlocker::Elicitation; "elicitation")]
 #[test_case::test_case(CompletedAgentUnloadBlocker::CodeModeCell; "code_mode_cell")]
+#[cfg_attr(unix, test_case::test_case(CompletedAgentUnloadBlocker::BackgroundTerminal; "background_terminal"))]
 #[test_case::test_case(CompletedAgentUnloadBlocker::TriggerMail; "trigger_mail")]
 #[test_case::test_case(CompletedAgentUnloadBlocker::ResumedTurn; "resumed_turn")]
 #[test_case::test_case(CompletedAgentUnloadBlocker::ActiveDescendant; "active_descendant")]
@@ -1067,6 +1069,7 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
     let delay = match blocker {
         CompletedAgentUnloadBlocker::TreeShutdown => 60,
         CompletedAgentUnloadBlocker::ExtremeDelay => i64::MAX,
+        CompletedAgentUnloadBlocker::BackgroundTerminal => 2,
         _ => 1,
     };
     let overrides = if matches!(blocker, CompletedAgentUnloadBlocker::Disabled) {
@@ -1082,8 +1085,23 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
     let _ = config.features.enable(Feature::Sqlite);
     config.ephemeral = matches!(blocker, CompletedAgentUnloadBlocker::Ephemeral);
     config.agent_max_depth = 2;
+    if matches!(blocker, CompletedAgentUnloadBlocker::BackgroundTerminal) {
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::Disabled)
+            .expect("test process permissions");
+        config
+            .permissions
+            .approval_policy
+            .set(AskForApproval::Never)
+            .expect("test process approval");
+    }
     let harness = AgentControlHarness::new_with_config(home, config).await;
-    let (root_id, root) = harness.start_paginated_thread().await;
+    let (root_id, root) = if matches!(blocker, CompletedAgentUnloadBlocker::BackgroundTerminal) {
+        harness.start_thread().await
+    } else {
+        harness.start_paginated_thread().await
+    };
     let control = root
         .session
         .services
@@ -1147,6 +1165,52 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
     })
     .await
     .expect("terminal turn should finish");
+    if matches!(blocker, CompletedAgentUnloadBlocker::BackgroundTerminal) {
+        let turn = thread.session.new_default_turn().await;
+        let manager = &thread.session.services.unified_exec_manager;
+        let context = crate::unified_exec::UnifiedExecContext::new(
+            Arc::clone(&thread.session),
+            StepContext::for_test(Arc::clone(&turn)),
+            CancellationToken::new(),
+            "unload-background-process".to_string(),
+        );
+        let environment = turn
+            .initial_environments
+            .primary()
+            .cloned()
+            .expect("local environment");
+        let request = crate::unified_exec::ExecCommandRequest {
+            command: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            shell: crate::shell::ShellInvocation {
+                shell: crate::shell::Shell {
+                    shell_type: crate::shell::ShellType::Sh,
+                    shell_path: "sh".into(),
+                },
+                use_login_shell: false,
+            },
+            hook_command: "sleep 30".to_string(),
+            process_id: manager.allocate_process_id().await,
+            yield_time_ms: 250,
+            max_output_tokens: Some(128),
+            cwd: environment.selection.cwd.clone(),
+            sandbox_cwd: environment.selection.cwd.clone(),
+            turn_environment: environment,
+            shell_mode: codex_tools::UnifiedExecShellMode::Direct,
+            network: None,
+            tty: false,
+            sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+            additional_permissions: None,
+            additional_permissions_preapproved: false,
+            justification: None,
+            prefix_rule: None,
+        };
+        let output = manager
+            .exec_command(request, &context)
+            .await
+            .expect("start real background process");
+        assert!(output.process_id.is_some());
+        assert!(!thread.list_background_terminals().await.is_empty());
+    }
     let cell_id = codex_code_mode::CellId::new("unload-guard-cell".to_string());
     if matches!(blocker, CompletedAgentUnloadBlocker::CodeModeCell) {
         thread
@@ -1179,7 +1243,12 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
             .await;
     }
     if !matches!(blocker, CompletedAgentUnloadBlocker::TreeShutdown) {
-        sleep(Duration::from_millis(1200)).await;
+        let wait_ms = if matches!(blocker, CompletedAgentUnloadBlocker::BackgroundTerminal) {
+            2200
+        } else {
+            1200
+        };
+        sleep(Duration::from_millis(wait_ms)).await;
         assert!(
             harness
                 .manager

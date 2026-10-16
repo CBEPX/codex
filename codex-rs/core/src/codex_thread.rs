@@ -256,8 +256,7 @@ impl CodexThread {
     }
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
-        self.submit_with_trace(op, current_span_w3c_trace_context())
-            .await
+        self.submit_with_trace(op, None).await
     }
 
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
