@@ -107,6 +107,10 @@ impl CodeModeService {
         self.availability.is_ok()
     }
 
+    pub(crate) fn has_active_cells(&self) -> bool {
+        !self.dispatch_broker.active_cell_ids().is_empty()
+    }
+
     pub(crate) fn take_unavailable_warning(&self, tool_mode: ToolMode) -> Option<String> {
         let error = self.availability.as_ref().err()?;
         let behavior = match tool_mode {

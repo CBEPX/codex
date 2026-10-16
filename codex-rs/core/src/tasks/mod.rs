@@ -550,17 +550,23 @@ impl Session {
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
         let mut aborted_turn = false;
         let mut active_turn_to_clear = None;
+        let mut completed_turn = None;
         if let Some(mut active_turn) = self.take_active_turn(&reason).await {
             let task = active_turn.task.take();
             aborted_turn = task.is_some();
             if let Some(task) = task {
-                self.handle_task_abort(
-                    task,
-                    reason.clone(),
-                    &active_turn.turn_state,
-                    /*error*/ None,
-                )
-                .await;
+                let turn = Arc::clone(&task.turn_context);
+                if self
+                    .handle_task_abort(
+                        task,
+                        reason.clone(),
+                        &active_turn.turn_state,
+                        /*error*/ None,
+                    )
+                    .await
+                {
+                    completed_turn = Some(turn);
+                }
             }
             if aborted_turn {
                 active_turn_to_clear = Some(active_turn);
@@ -574,6 +580,13 @@ impl Session {
         }
         if reason == TurnAbortReason::Interrupted && aborted_turn {
             self.maybe_start_turn_for_pending_work().await;
+        }
+        if matches!(
+            reason,
+            TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
+        ) && let Some(turn) = completed_turn
+        {
+            self.schedule_completed_agent_unload(&turn).await;
         }
     }
 
@@ -616,9 +629,15 @@ impl Session {
         error: Option<ErrorEvent>,
     ) {
         let task = active_turn.task.take();
+        let mut completed_turn = None;
         if let Some(task) = task {
-            self.handle_task_abort(task, reason.clone(), &active_turn.turn_state, error)
-                .await;
+            let turn = Arc::clone(&task.turn_context);
+            if self
+                .handle_task_abort(task, reason.clone(), &active_turn.turn_state, error)
+                .await
+            {
+                completed_turn = Some(turn);
+            }
         }
         // Let interrupted tasks observe cancellation before dropping pending approvals, or an
         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
@@ -626,6 +645,13 @@ impl Session {
 
         if reason == TurnAbortReason::Interrupted {
             self.maybe_start_turn_for_pending_work().await;
+        }
+        if matches!(
+            reason,
+            TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
+        ) && let Some(turn) = completed_turn
+        {
+            self.schedule_completed_agent_unload(&turn).await;
         }
     }
 
@@ -887,11 +913,22 @@ impl Session {
         }
         // Private reviewers already flushed the terminal event before delivering it.
         // Other buffering writers still need a barrier for the terminal event.
-        if !saved_guardian_completion && let Err(err) = self.flush_rollout().await {
-            warn!("failed to flush rollout after emitting terminal turn event: {err}");
-        }
+        let flushed = if saved_guardian_completion {
+            true
+        } else {
+            match self.flush_rollout().await {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!("failed to flush rollout after emitting terminal turn event: {err}");
+                    false
+                }
+            }
+        };
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
+            if flushed {
+                self.schedule_completed_agent_unload(&turn_context).await;
+            }
         }
     }
 
@@ -933,12 +970,12 @@ impl Session {
         reason: TurnAbortReason,
         turn_state: &Mutex<TurnState>,
         error: Option<ErrorEvent>,
-    ) {
+    ) -> bool {
         let sub_id = task.turn_context.sub_id.clone();
         if task.cancellation_token.is_cancelled() {
             self.emit_turn_abort_lifecycle(reason, task.turn_context.extension_data.as_ref())
                 .await;
-            return;
+            return false;
         }
 
         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
@@ -1029,8 +1066,12 @@ impl Session {
         self.send_event(task.turn_context.as_ref(), event).await;
         // Regular items were flushed before this terminal event was appended; buffering
         // thread writers may not flush it without another explicit barrier.
-        if let Err(err) = self.flush_rollout().await {
-            warn!("failed to flush rollout after emitting terminal turn event: {err}");
+        match self.flush_rollout().await {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("failed to flush rollout after emitting terminal turn event: {err}");
+                false
+            }
         }
     }
 }

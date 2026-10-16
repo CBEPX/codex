@@ -6,7 +6,10 @@ use super::runtime::AgentTreeMembership;
 use crate::agent::AgentStatus;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
+use crate::session::session::Session;
 use crate::thread_manager::ThreadManagerState;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
 use codex_protocol::ThreadId;
 use codex_protocol::error::AgentErrorContext;
 use codex_protocol::error::CodexErr;
@@ -15,9 +18,13 @@ use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
+use codex_thread_store::ReadThreadParams;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 /// The result of trying to unload one exact MAv2 child runtime.
@@ -51,6 +58,17 @@ impl ThreadManagerState {
         if !is_resident_candidate(&thread) || !is_unloadable(&thread).await {
             return Ok(ThreadEvictionOutcome::Busy);
         }
+        self.start_v2_eviction(thread, membership, residency_guard)
+            .await?
+    }
+
+    fn start_v2_eviction(
+        self: &Arc<Self>,
+        thread: Arc<CodexThread>,
+        membership: &AgentTreeMembership,
+        residency_guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    ) -> tokio::task::JoinHandle<CodexResult<ThreadEvictionOutcome>> {
+        let thread_id = thread.session.thread_id;
         let manager = Arc::clone(self);
         let teardown = membership
             .clone()
@@ -97,7 +115,6 @@ impl ThreadManagerState {
                 ThreadEvictionOutcome::NotCurrent
             })
         })
-        .await?
     }
 }
 
@@ -110,6 +127,19 @@ pub(super) struct V2Residency {
 struct V2ResidencyState {
     residents: VecDeque<ThreadId>,
     pending_slots: usize,
+    unload_timers: HashMap<ThreadId, Arc<CancellationToken>>,
+}
+
+impl Drop for V2Residency {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for timer in state.unload_timers.values() {
+            timer.cancel();
+        }
+    }
 }
 
 pub(super) struct V2ResidencySlot {
@@ -148,24 +178,118 @@ impl LocalAgentControl {
             .await
     }
 
+    pub(super) async fn touch_loaded_v2_residency(
+        &self,
+        state: &Arc<ThreadManagerState>,
+        thread_id: ThreadId,
+    ) -> CodexResult<Option<tokio::sync::OwnedRwLockReadGuard<()>>> {
+        let thread = state.get_thread(thread_id).await?;
+        let guard = self.runtime.pin_v2_residency(&thread).await?;
+        self.runtime.cancel_completed_agent_unload(thread_id);
+        Ok(guard)
+    }
+
     pub(super) fn forget_v2_residency(&self, thread_id: ThreadId) {
         self.runtime.residency.remove(thread_id);
     }
 }
 
 impl LocalAgentRuntime {
+    #[cfg(test)]
+    pub(crate) fn has_completed_agent_unload_timer(&self, thread_id: ThreadId) -> bool {
+        self.residency
+            .state
+            .lock()
+            .unwrap()
+            .unload_timers
+            .contains_key(&thread_id)
+    }
+
+    pub(crate) fn cancel_completed_agent_unload(&self, thread_id: ThreadId) {
+        self.residency.cancel_unload_timer(thread_id);
+    }
+
+    pub(crate) fn schedule_completed_agent_unload(&self, session: &Arc<Session>, delay_secs: u64) {
+        let thread_id = session.thread_id;
+        let Some(deadline) =
+            tokio::time::Instant::now().checked_add(Duration::from_secs(delay_secs))
+        else {
+            warn!(%thread_id, "completed agent unload delay exceeds the timer range; skip unload");
+            return;
+        };
+        let Ok(membership) = self.admit_start() else {
+            return;
+        };
+        let timer = Arc::new(CancellationToken::new());
+        {
+            let mut state = self
+                .residency
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(previous) = state.unload_timers.insert(thread_id, Arc::clone(&timer)) {
+                previous.cancel();
+            }
+        }
+        let residency = Arc::downgrade(&self.residency);
+        let manager = self.manager.clone();
+        let session = Arc::downgrade(session);
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            let unload = async {
+                tokio::time::sleep_until(deadline).await;
+                for attempt in 0..2 {
+                    let done = match (residency.upgrade(), manager.upgrade(), session.upgrade()) {
+                        (Some(residency), Some(manager), Some(session)) => {
+                            residency
+                                .try_unload_completed(&manager, &membership, &session, &timer)
+                                .await
+                        }
+                        _ => true,
+                    };
+                    if done {
+                        return;
+                    }
+                    if attempt == 0 {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+                warn!(%thread_id, "completed agent unload is blocked after one retry; keep runtime loaded");
+            };
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {},
+                _ = timer.cancelled() => {},
+                _ = unload => {},
+            }
+            if let Some(residency) = residency.upgrade() {
+                let mut state = residency
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state
+                    .unload_timers
+                    .get(&thread_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &timer))
+                {
+                    state.unload_timers.remove(&thread_id);
+                }
+            }
+        });
+    }
+
     /// Pins and touches the registered runtime without waiting for unrelated eviction.
     pub(crate) async fn pin_v2_residency(
         &self,
-        state: &ThreadManagerState,
-        thread: &Arc<CodexThread>,
+        thread: &CodexThread,
     ) -> CodexResult<Option<tokio::sync::OwnedRwLockReadGuard<()>>> {
         if !is_resident_candidate(thread) {
             return Ok(None);
         }
         let guard = Arc::clone(&thread.residency_gate).read_owned().await;
         let thread_id = thread.session.thread_id;
-        if !Arc::ptr_eq(thread, &state.get_thread(thread_id).await?) {
+        let registered = self.upgrade()?.get_thread(thread_id).await?;
+        if !std::ptr::eq(thread, registered.as_ref()) {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
         self.residency.touch(thread_id);
@@ -174,6 +298,129 @@ impl LocalAgentRuntime {
 }
 
 impl V2Residency {
+    async fn try_unload_completed(
+        self: &Arc<Self>,
+        manager: &Arc<ThreadManagerState>,
+        membership: &AgentTreeMembership,
+        session: &Arc<Session>,
+        timer: &CancellationToken,
+    ) -> bool {
+        let thread_id = session.thread_id;
+        let Ok(thread) = manager.get_thread(thread_id).await else {
+            return true;
+        };
+        if !Arc::ptr_eq(session, &thread.session) || !is_resident_candidate(&thread) {
+            return true;
+        }
+        if !is_completed_unloadable(&thread).await || has_background_work(&thread).await {
+            return false;
+        }
+        let runtime = &session.services.local_agent_runtime;
+        // Startup publishes metadata after the initial turn is admitted.
+        if runtime
+            .registry
+            .agent_metadata_for_thread(thread_id)
+            .is_none()
+        {
+            return false;
+        }
+        let reloadable = async {
+            let stored = manager
+                .read_stored_thread(ReadThreadParams {
+                    thread_id,
+                    include_archived: false,
+                    include_history: false,
+                })
+                .await?;
+            let Some(history) =
+                super::spawn::load_agent_model_context(manager, thread_id, stored.history_mode)
+                    .await?
+            else {
+                return Ok::<_, CodexErr>(false);
+            };
+            let history = InitialHistory::Resumed(ResumedHistory {
+                history_revision: history.revision,
+                conversation_id: thread_id,
+                history: Arc::new(history.items),
+                rollout_path: stored.rollout_path,
+            });
+            Ok(history.get_multi_agent_version() == Some(MultiAgentVersion::V2))
+        }
+        .await;
+        match reloadable {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(%thread_id, "completed agent has no reloadable saved history; keep runtime loaded");
+                return true;
+            }
+            Err(err) => {
+                warn!(%thread_id, "failed to check completed agent history: {err}");
+                return false;
+            }
+        }
+        // Read saved history without blocking input. Recheck the runtime and its
+        // activity after acquiring exclusion because a turn can start during the read.
+        let Ok(guard) = Arc::clone(&thread.residency_gate).try_write_owned() else {
+            return false;
+        };
+        if timer.is_cancelled()
+            || !manager
+                .get_thread(thread_id)
+                .await
+                .is_ok_and(|current| Arc::ptr_eq(&current, &thread))
+            || !is_completed_unloadable(&thread).await
+            || has_background_work(&thread).await
+            || timer.is_cancelled()
+        {
+            return false;
+        }
+        let Ok(descendants) = runtime.live_thread_spawn_descendants(thread_id).await else {
+            return false;
+        };
+        let mut checked_threads = vec![Arc::clone(&thread)];
+        for descendant in descendants {
+            if let Ok(descendant) = manager.get_thread(descendant).await {
+                if !is_completed_unloadable(&descendant).await
+                    || has_background_work(&descendant).await
+                {
+                    return false;
+                }
+                checked_threads.push(descendant);
+            }
+        }
+        let eviction = {
+            // No await between the final admission checks and teardown spawn. A turn
+            // admitted after this point can deliver its result to the unloaded parent.
+            let mut admission_guards = Vec::with_capacity(checked_threads.len());
+            for checked in &checked_threads {
+                let Ok(active) = checked.session.active_turn.try_lock() else {
+                    return false;
+                };
+                if active.is_some() {
+                    return false;
+                }
+                admission_guards.push(active);
+            }
+            if timer.is_cancelled() {
+                return false;
+            }
+            manager.start_v2_eviction(thread, membership, guard)
+        };
+        finish_eviction(eviction).await
+    }
+
+    fn cancel_unload_timer(&self, thread_id: ThreadId) {
+        if let Some(timer) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unload_timers
+            .remove(&thread_id)
+        {
+            timer.cancel();
+        }
+    }
+
     async fn reserve_slot(
         self: Arc<Self>,
         manager: &Arc<ThreadManagerState>,
@@ -267,10 +514,15 @@ impl V2Residency {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        touch_resident(&mut state.residents, thread_id);
+        // Initial input can pin a published runtime before its reserved slot commits.
+        // Only commit_slot inserts residents, so startup is counted exactly once.
+        if state.residents.contains(&thread_id) {
+            touch_resident(&mut state.residents, thread_id);
+        }
     }
 
     fn remove(&self, thread_id: ThreadId) {
+        self.cancel_unload_timer(thread_id);
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -301,6 +553,23 @@ fn touch_resident(residents: &mut VecDeque<ThreadId>, thread_id: ThreadId) {
     residents.push_back(thread_id);
 }
 
+async fn finish_eviction(
+    eviction: tokio::task::JoinHandle<CodexResult<ThreadEvictionOutcome>>,
+) -> bool {
+    match eviction.await {
+        Ok(Ok(ThreadEvictionOutcome::Evicted | ThreadEvictionOutcome::NotCurrent)) => true,
+        Ok(Ok(ThreadEvictionOutcome::Busy)) => false,
+        Ok(Err(err)) => {
+            warn!("v2 resident eviction failed: {err}");
+            false
+        }
+        Err(err) => {
+            warn!("v2 resident eviction task failed: {err}");
+            false
+        }
+    }
+}
+
 fn is_resident_candidate(thread: &CodexThread) -> bool {
     thread.multi_agent_version() == Some(MultiAgentVersion::V2)
         && is_v2_resident_session_source(&thread.session_source)
@@ -324,6 +593,20 @@ async fn is_unloadable(thread: &CodexThread) -> bool {
             .input_queue
             .has_trigger_turn_mailbox_items()
             .await
+}
+
+async fn is_completed_unloadable(thread: &CodexThread) -> bool {
+    matches!(
+        thread.agent_status().await,
+        AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
+    ) && is_unloadable(thread).await
+}
+
+async fn has_background_work(thread: &CodexThread) -> bool {
+    let awaiting_elicitation = *thread.session.subscribe_elicitation_pause_state().borrow();
+    awaiting_elicitation
+        || thread.session.services.code_mode_service.has_active_cells()
+        || !thread.session.list_background_terminals().await.is_empty()
 }
 
 #[cfg(test)]
