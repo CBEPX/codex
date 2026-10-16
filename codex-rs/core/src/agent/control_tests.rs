@@ -1320,7 +1320,6 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
             cwd: environment.selection.cwd.clone(),
             sandbox_cwd: environment.selection.cwd.clone(),
             turn_environment: environment,
-            shell_mode: codex_tools::UnifiedExecShellMode::Direct,
             network: None,
             tty: false,
             sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
@@ -1516,6 +1515,7 @@ async fn completed_agent_unload_interrupt_during_teardown_preserves_reload() {
     control
         .ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, None)
         .await
+        .map(drop)
         .expect("interrupted child remains reloadable");
     let reloaded = harness
         .manager
@@ -1782,6 +1782,7 @@ async fn completed_agent_unload_preserves_history_and_root(
     control
         .ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, None)
         .await
+        .map(drop)
         .expect("reload completed child");
     let reloaded = harness
         .manager
