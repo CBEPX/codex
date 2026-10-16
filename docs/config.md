@@ -30,7 +30,7 @@ completed_agent_unload_delay_secs = 60
 Enable this setting only in a profile whose MCP servers and tools can restart
 without losing required state. Unload stops the child session and its MCP clients.
 Saved conversation history, queue-only mail, and environment selections survive.
-Transient REPL variables, subscriptions, and server-side tasks do not survive.
+Codex does not restore transient REPL variables, subscriptions, or server-side tasks.
 
 An active turn, durable sleep, trigger mail, background terminal, active code-mode
 cell, approval, or active descendant blocks unload. Codex retries a blocked unload

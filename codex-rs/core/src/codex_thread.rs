@@ -702,6 +702,12 @@ impl CodexThread {
         &self,
         thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
     ) -> CodexResult<()> {
+        let _residency_guard = self
+            .session
+            .services
+            .local_agent_runtime
+            .pin_v2_residency(self)
+            .await?;
         let (reply, result) = oneshot::channel();
         let WithTurnExtensionData {
             request: thread_settings,

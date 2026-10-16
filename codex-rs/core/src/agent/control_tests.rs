@@ -99,6 +99,7 @@ use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::PersistContext;
 use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
+use core_test_support::responses::strip_metadata_from_items;
 use core_test_support::responses::strip_response_item_ids;
 use pretty_assertions::assert_eq;
 use std::future::Future;
@@ -1074,9 +1075,13 @@ async fn persist_completed_agent_unload_fixture(
         .expect("record fixture history while idle");
     thread.flush_rollout().await.expect("flush fixture history");
     let history = thread.session.clone_history().await;
+    let actual = strip_response_item_ids(&strip_metadata_from_items(
+        &history.raw_items().cloned().collect::<Vec<_>>(),
+    ));
+    let expected = strip_response_item_ids(&strip_metadata_from_items(std::slice::from_ref(item)));
     assert!(
-        strip_response_item_ids(&history.raw_items().cloned().collect::<Vec<_>>()).contains(item),
-        "fixture history must exist before terminal completion"
+        actual.contains(&expected[0]),
+        "fixture history must exist before terminal completion: actual={actual:?}, expected={expected:?}"
     );
     guard
 }
@@ -1614,9 +1619,13 @@ async fn completed_agent_unload_preserves_history_and_root(
     assert!(!Arc::ptr_eq(&thread, &reloaded));
     assert_eq!(reloaded.environment_selections().await, environments);
     let history = reloaded.session.clone_history().await;
+    let actual = strip_response_item_ids(&strip_metadata_from_items(
+        &history.raw_items().cloned().collect::<Vec<_>>(),
+    ));
+    let expected = strip_response_item_ids(&strip_metadata_from_items(&[history_item]));
     assert!(
-        strip_response_item_ids(&history.raw_items().cloned().collect::<Vec<_>>())
-            .contains(&history_item)
+        actual.contains(&expected[0]),
+        "reloaded history must retain the marker: actual={actual:?}, expected={expected:?}"
     );
     harness
         .manager
