@@ -108,10 +108,6 @@ impl AgentControl for LocalAgentControl {
                 mut start_options,
             } = request;
             let target = self.resolve_target(caller, &target)?;
-            let reload_after_eviction = resume_config
-                .multi_agent_v2
-                .completed_agent_unload_delay_secs
-                .is_some();
             let (metadata, submission_id) = match input {
                 AgentInput::UserInput(input) => {
                     let receiver = self.get_agent_metadata(target);
@@ -128,8 +124,7 @@ impl AgentControl for LocalAgentControl {
                         .await;
                     // ThreadNotFound comes from the residency pin before submission.
                     // Never replay a request that reached the session and then failed.
-                    let submission_id = if reload_after_eviction
-                        && receiver.is_some()
+                    let submission_id = if receiver.is_some()
                         && result.as_ref().is_err_and(|err| {
                             matches!(err.details(), CodexErrorDetails::ThreadNotFound(_))
                         }) {
@@ -190,14 +185,12 @@ impl AgentControl for LocalAgentControl {
                             start_options.clone(),
                         )
                         .await;
-                    let submission_id = if reload_after_eviction
+                    let submission_id = if mode == MessageDeliveryMode::TriggerTurn
                         && result.as_ref().is_err_and(|err| {
                             matches!(err.details(), CodexErrorDetails::ThreadNotFound(_))
                         }) {
-                        if mode == MessageDeliveryMode::TriggerTurn {
-                            self.ensure_v2_agent_loaded(resume_config, target, None)
-                                .await?;
-                        }
+                        self.ensure_v2_agent_loaded(resume_config, target, None)
+                            .await?;
                         self.send_inter_agent_communication(
                             target,
                             communication,

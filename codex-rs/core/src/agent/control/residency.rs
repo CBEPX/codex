@@ -219,9 +219,6 @@ impl V2Residency {
         if !Arc::ptr_eq(session, &thread.session) || !is_resident_candidate(&thread) {
             return true;
         }
-        let Ok(guard) = Arc::clone(&thread.residency_gate).try_write_owned() else {
-            return false;
-        };
         if !is_unloadable(&thread).await || has_background_work(&thread).await {
             return false;
         }
@@ -257,10 +254,22 @@ impl V2Residency {
             Ok(history.get_multi_agent_version() == Some(MultiAgentVersion::V2))
         }
         .await;
-        if !matches!(reloadable, Ok(true)) {
-            warn!(%thread_id, "completed agent has no reloadable saved history; keep runtime loaded");
-            return true;
+        match reloadable {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(%thread_id, "completed agent has no reloadable saved history; keep runtime loaded");
+                return true;
+            }
+            Err(err) => {
+                warn!(%thread_id, "failed to check completed agent history: {err}");
+                return false;
+            }
         }
+        // Read saved history without blocking input. Recheck the runtime and its
+        // activity after acquiring exclusion because a turn can start during the read.
+        let Ok(guard) = Arc::clone(&thread.residency_gate).try_write_owned() else {
+            return false;
+        };
         if timer.is_cancelled()
             || !manager
                 .get_thread(thread_id)

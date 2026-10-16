@@ -1473,16 +1473,22 @@ async fn completed_agent_unload_resume_waits_for_eviction_and_reloads(
         .expect("resume reloads after lost pin");
     if queue_only {
         assert!(harness.manager.get_thread(child.thread_id).await.is_err());
-        assert_eq!(
-            control.take_mailbox(child.thread_id),
-            vec![InterAgentCommunication::new(
+        let expected = if terminal_result {
+            InterAgentCommunication::new(
                 AgentPath::root(),
                 AgentPath::try_from("/root/worker").expect("agent path"),
                 Vec::new(),
                 "delivered once".into(),
-                false
-            )]
-        );
+                false,
+            )
+        } else {
+            AgentMessage::Plaintext("delivered once".into()).into_communication(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("agent path"),
+                MessageDeliveryMode::QueueOnly,
+            )
+        };
+        assert_eq!(control.take_mailbox(child.thread_id), vec![expected]);
     } else {
         let reloaded = harness
             .manager
@@ -1551,13 +1557,12 @@ async fn completed_agent_unload_preserves_history_and_root(
             .await;
     }
 
-    let queued_mail = InterAgentCommunication::new(
-        AgentPath::root(),
-        AgentPath::try_from("/root/worker").expect("agent path"),
-        Vec::new(),
-        "queue-only mail survives unload".to_string(),
-        false,
-    );
+    let queued_mail = AgentMessage::Plaintext("queue-only mail survives unload".to_string())
+        .into_communication(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            MessageDeliveryMode::QueueOnly,
+        );
     if delay > 0 {
         timeout(Duration::from_secs(1), async {
             while !matches!(thread.agent_status().await, AgentStatus::Completed(_))
