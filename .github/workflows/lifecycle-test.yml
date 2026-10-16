@@ -82,6 +82,9 @@ jobs:
           SUITE: ${{ inputs.suite }}
         run: |
           set -euo pipefail
+          if [ "$SUITE" = packages ]; then
+            cargo build --locked --profile dev-small --bin codex-code-mode-host
+          fi
           case "$SUITE" in
             features) cargo test --locked --profile dev-small -p codex-features --lib 2>&1 | tee "$RUNNER_TEMP/tests.log" ;;
             lifecycle)
