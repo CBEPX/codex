@@ -101,6 +101,16 @@ impl LocalAgentControl {
 }
 
 impl LocalAgentRuntime {
+    #[cfg(test)]
+    pub(crate) fn has_completed_agent_unload_timer(&self, thread_id: ThreadId) -> bool {
+        self.residency
+            .state
+            .lock()
+            .unwrap()
+            .unload_timers
+            .contains_key(&thread_id)
+    }
+
     pub(crate) fn cancel_completed_agent_unload(&self, thread_id: ThreadId) {
         self.residency.cancel_unload_timer(thread_id);
     }

@@ -1442,17 +1442,30 @@ async fn completed_agent_unload_preserves_history_and_root(
         timeout(Duration::from_secs(1), async {
             while !matches!(thread.agent_status().await, AgentStatus::Completed(_))
                 || thread.session.active_turn.lock().await.is_some()
+                || !thread
+                    .session
+                    .services
+                    .local_agent_runtime
+                    .has_completed_agent_unload_timer(child.thread_id)
             {
                 sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("terminal result before unload deadline");
-        thread
-            .session
-            .input_queue
-            .enqueue_mailbox_communication(queued_mail.clone(), Default::default())
-            .await;
+        control
+            .send(crate::SendRequest {
+                caller: root_id,
+                target: crate::AgentTarget::Id(child.thread_id),
+                resume_config: harness.config.clone(),
+                input: AgentInput::Message {
+                    message: AgentMessage::Plaintext("queue-only mail survives unload".to_string()),
+                    mode: MessageDeliveryMode::QueueOnly,
+                },
+                start_options: Default::default(),
+            })
+            .await
+            .expect("deliver queue-only mail after the unload timer is armed");
         assert!(harness.manager.get_thread(child.thread_id).await.is_ok());
     }
 
