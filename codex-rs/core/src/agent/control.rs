@@ -241,14 +241,44 @@ impl LocalAgentControl {
         context: AgentCommunicationContext,
         start_options: TurnStartOptions,
     ) -> CodexResult<String> {
-        self.submit_inter_agent_communication(
-            agent_id,
-            state,
-            communication,
-            context,
-            start_options,
-        )
-        .await
+        if communication.trigger_turn {
+            return self
+                .submit_inter_agent_communication(
+                    agent_id,
+                    state,
+                    communication,
+                    context,
+                    start_options,
+                )
+                .await;
+        }
+        let result = self
+            .submit_inter_agent_communication(
+                agent_id,
+                state,
+                communication.clone(),
+                context.clone(),
+                start_options.clone(),
+            )
+            .await;
+        // Eviction can remove a loaded recipient before its residency pin succeeds.
+        // Retry queue-only delivery once through the mailbox path, including results.
+        // ThreadNotFound precedes submission; accepted requests are never replayed.
+        if result
+            .as_ref()
+            .is_err_and(|err| matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)))
+        {
+            self.submit_inter_agent_communication(
+                agent_id,
+                state,
+                communication,
+                context,
+                start_options,
+            )
+            .await
+        } else {
+            result
+        }
     }
 
     async fn submit_inter_agent_communication(
