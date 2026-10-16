@@ -1724,12 +1724,12 @@ impl ThreadManagerState {
         root_turn_id: Option<String>,
     ) -> CodexResult<String> {
         let thread = self.get_thread(thread_id).await?;
-        let residency_guard = if matches!(op, Op::InterAgentCommunication { .. }) {
+        let residency_guard = if !matches!(op, Op::Shutdown) {
             thread
                 .session
                 .services
                 .local_agent_runtime
-                .pin_v2_residency(self, &thread)
+                .pin_v2_residency(&thread)
                 .await?
         } else {
             None

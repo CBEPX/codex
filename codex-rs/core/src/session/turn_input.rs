@@ -655,8 +655,38 @@ impl Session {
     ) {
         let mut state = self.state.lock().await;
         state.last_started_turn_id = Some(turn_id.to_owned());
+        self.services
+            .local_agent_runtime
+            .cancel_completed_agent_unload(self.thread_id);
         if let Some(attribution) = attribution {
             state.turn_attribution = Some(attribution);
+        }
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "The active-turn lock serializes scheduling with turn admission."
+    )]
+    pub(crate) async fn schedule_completed_agent_unload(self: &Arc<Self>, turn: &TurnContext) {
+        let Some(delay) = turn.config.multi_agent_v2.completed_agent_unload_delay_secs else {
+            return;
+        };
+        if turn.multi_agent_version != codex_protocol::protocol::MultiAgentVersion::V2
+            || !matches!(turn.session_source, SessionSource::SubAgent(_))
+            || turn.config.ephemeral
+        {
+            return;
+        }
+        // Serialize the deadline with turn admission, including turns that have no task yet.
+        let active = self.active_turn.lock().await;
+        let state = self.state.lock().await;
+        if active.is_none()
+            && !state.shutting_down
+            && state.last_started_turn_id.as_deref() == Some(turn.sub_id.as_str())
+        {
+            self.services
+                .local_agent_runtime
+                .schedule_completed_agent_unload(self, delay);
         }
     }
 

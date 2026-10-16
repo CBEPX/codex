@@ -18,6 +18,99 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
+use std::time::Duration;
+
+#[test]
+fn completed_agent_unload_pin_during_startup_does_not_count_reservation_twice() {
+    let residency = Arc::new(super::V2Residency::default());
+    let first_id = ThreadId::new();
+    assert!(residency.try_reserve_pending_slot(2));
+    let first = super::V2ResidencySlot {
+        residency: Arc::clone(&residency),
+        active: true,
+    };
+    // Initial input pins the published thread before spawn commits its reserved slot.
+    residency.touch(first_id);
+    assert!(
+        residency.try_reserve_pending_slot(2),
+        "a pending startup must use exactly one slot"
+    );
+    let second = super::V2ResidencySlot {
+        residency: Arc::clone(&residency),
+        active: true,
+    };
+    first.commit(first_id);
+    assert!(!residency.try_reserve_pending_slot(2));
+    drop(second);
+    assert!(residency.try_reserve_pending_slot(2));
+}
+
+#[tokio::test]
+async fn completed_agent_unload_timer_does_not_retain_session_or_delay_tree_shutdown() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let weak_session = Arc::downgrade(&session);
+    let runtime = session.services.local_agent_runtime.clone();
+    runtime.schedule_completed_agent_unload(&session, 60);
+    drop(turn);
+    drop(session);
+    assert!(
+        weak_session.upgrade().is_none(),
+        "pending timer must not own the session"
+    );
+    tokio::time::timeout(Duration::from_secs(1), runtime.request_shutdown().wait())
+        .await
+        .expect("pending timer must leave the tree promptly")
+        .expect("tree shutdown");
+}
+
+#[tokio::test]
+async fn completed_agent_unload_replaces_deadline_and_turn_admission_cancels_it() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let runtime = &session.services.local_agent_runtime;
+    runtime.schedule_completed_agent_unload(&session, 60);
+    let first =
+        Arc::clone(&runtime.residency.state.lock().unwrap().unload_timers[&session.thread_id]);
+    runtime.schedule_completed_agent_unload(&session, 120);
+    let second =
+        Arc::clone(&runtime.residency.state.lock().unwrap().unload_timers[&session.thread_id]);
+    assert!(first.is_cancelled());
+    assert!(!second.is_cancelled());
+    assert!(!Arc::ptr_eq(&first, &second));
+    session.record_started_turn("new-turn", None).await;
+    assert!(second.is_cancelled());
+    assert!(
+        runtime
+            .residency
+            .state
+            .lock()
+            .unwrap()
+            .unload_timers
+            .is_empty()
+    );
+    tokio::time::timeout(Duration::from_secs(1), runtime.request_shutdown().wait())
+        .await
+        .expect("cancelled deadlines must leave the tree")
+        .expect("tree shutdown");
+}
+
+#[tokio::test]
+async fn completed_agent_unload_skips_unrepresentable_deadline() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let runtime = &session.services.local_agent_runtime;
+    runtime.schedule_completed_agent_unload(&session, u64::MAX);
+    assert!(
+        runtime
+            .residency
+            .state
+            .lock()
+            .unwrap()
+            .unload_timers
+            .is_empty()
+    );
+}
 
 #[tokio::test]
 async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
