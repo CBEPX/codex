@@ -1372,6 +1372,72 @@ async fn completed_agent_unload_excludes_direct_turn_input(settings: bool) {
         .await;
 }
 
+#[tokio::test]
+async fn completed_agent_unload_interrupt_during_teardown_preserves_reload() {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let _ = config.features.enable(Feature::Sqlite);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (_, root) = harness.start_paginated_thread().await;
+    let control = root
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.session.session_id());
+    let child = spawn_v2_reload_test_child(&control, harness.config.clone(), &root, "worker").await;
+    let thread = harness
+        .manager
+        .get_thread(child.thread_id)
+        .await
+        .expect("loaded child");
+    drop(
+        persist_completed_agent_unload_fixture(
+            &thread,
+            &assistant_message(
+                "persisted before interrupt",
+                Some(MessagePhase::FinalAnswer),
+            ),
+        )
+        .await,
+    );
+    let eviction_guard = Arc::clone(&thread.residency_gate).write_owned().await;
+    // Teardown has stopped the receiver, but has not removed the registered runtime.
+    thread.shutdown_and_wait().await.expect("stop old runtime");
+    let mut interrupt = Box::pin(control.interrupt_agent(child.thread_id));
+    assert!(
+        timeout(Duration::from_millis(50), &mut interrupt)
+            .await
+            .is_err(),
+        "interrupt must wait for teardown instead of submitting to its closed receiver"
+    );
+    harness
+        .manager
+        .remove_thread(&child.thread_id)
+        .await
+        .expect("remove old runtime");
+    control.forget_v2_residency(child.thread_id);
+    drop(eviction_guard);
+    let result = timeout(Duration::from_secs(10), interrupt)
+        .await
+        .expect("interrupt completes");
+    assert_matches!(result, Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)));
+    assert!(control.get_agent_metadata(child.thread_id).is_some());
+    control
+        .ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, None)
+        .await
+        .expect("interrupted child remains reloadable");
+    let reloaded = harness
+        .manager
+        .get_thread(child.thread_id)
+        .await
+        .expect("reloaded child");
+    assert!(!Arc::ptr_eq(&thread, &reloaded));
+    harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+}
+
 #[test_case::test_case(false, false; "resume")]
 #[test_case::test_case(true, false; "queue_only_caller_without_unload")]
 #[test_case::test_case(true, true; "terminal_result_during_teardown")]
