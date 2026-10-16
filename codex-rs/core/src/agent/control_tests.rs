@@ -1190,15 +1190,28 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
         .session
         .spawn_task(turn, Vec::new(), CompletedAgentUnloadTask::Completed)
         .await;
+    let expects_timer = !matches!(
+        blocker,
+        CompletedAgentUnloadBlocker::Disabled
+            | CompletedAgentUnloadBlocker::Root
+            | CompletedAgentUnloadBlocker::Ephemeral
+            | CompletedAgentUnloadBlocker::ExtremeDelay
+    );
     timeout(Duration::from_secs(10), async {
         while !matches!(thread.agent_status().await, AgentStatus::Completed(_))
             || thread.session.active_turn.lock().await.is_some()
+            || (expects_timer
+                && !thread
+                    .session
+                    .services
+                    .local_agent_runtime
+                    .has_completed_agent_unload_timer(thread.session.thread_id))
         {
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("terminal turn should finish");
+    .expect("terminal turn should finish and arm its unload timer when enabled");
     if matches!(blocker, CompletedAgentUnloadBlocker::BackgroundTerminal) {
         let turn = thread.session.new_default_turn().await;
         let manager = &thread.session.services.unified_exec_manager;
