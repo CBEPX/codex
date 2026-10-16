@@ -128,6 +128,8 @@ struct V2ResidencyState {
     residents: VecDeque<ThreadId>,
     pending_slots: usize,
     unload_timers: HashMap<ThreadId, Arc<CancellationToken>>,
+    #[cfg(test)]
+    unload_attempts: HashMap<ThreadId, usize>,
 }
 
 impl Drop for V2Residency {
@@ -205,6 +207,18 @@ impl LocalAgentRuntime {
             .contains_key(&thread_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn completed_agent_unload_attempts(&self, thread_id: ThreadId) -> usize {
+        self.residency
+            .state
+            .lock()
+            .unwrap()
+            .unload_attempts
+            .get(&thread_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     pub(crate) fn cancel_completed_agent_unload(&self, thread_id: ThreadId) {
         self.residency.cancel_unload_timer(thread_id);
     }
@@ -227,6 +241,8 @@ impl LocalAgentRuntime {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(test)]
+            state.unload_attempts.insert(thread_id, 0);
             if let Some(previous) = state.unload_timers.insert(thread_id, Arc::clone(&timer)) {
                 previous.cancel();
             }
@@ -241,9 +257,21 @@ impl LocalAgentRuntime {
                 for attempt in 0..2 {
                     let done = match (residency.upgrade(), manager.upgrade(), session.upgrade()) {
                         (Some(residency), Some(manager), Some(session)) => {
-                            residency
+                            let done = residency
                                 .try_unload_completed(&manager, &membership, &session, &timer)
-                                .await
+                                .await;
+                            #[cfg(test)]
+                            {
+                                let mut state = residency.state.lock().unwrap();
+                                if state
+                                    .unload_timers
+                                    .get(&thread_id)
+                                    .is_some_and(|current| Arc::ptr_eq(current, &timer))
+                                {
+                                    *state.unload_attempts.entry(thread_id).or_default() += 1;
+                                }
+                            }
+                            done
                         }
                         _ => true,
                     };
@@ -515,7 +543,8 @@ impl V2Residency {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Initial input can pin a published runtime before its reserved slot commits.
-        // Only commit_slot inserts residents, so startup is counted exactly once.
+        // V2 spawn and lazy reload reserve a slot, then commit it after admission or
+        // registration. Only commit_slot inserts residents, so startup counts once.
         if state.residents.contains(&thread_id) {
             touch_resident(&mut state.residents, thread_id);
         }

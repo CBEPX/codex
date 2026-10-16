@@ -33,10 +33,18 @@ Saved conversation history, queue-only mail, and environment selections survive.
 Codex does not restore transient REPL variables, subscriptions, or server-side tasks.
 
 An active turn, durable sleep, trigger mail, background terminal, active code-mode
-cell, approval, or active descendant blocks unload. Codex retries a blocked unload
-once after five seconds, then keeps the runtime loaded. Resume or a new turn cancels
-the pending deadline. A later terminal turn can set a new deadline.
+cell, pending elicitation, or active descendant blocks unload. Codex retries a blocked
+unload once after five seconds, then keeps the runtime loaded. Resume or a new turn
+cancels the pending deadline. A later terminal turn can set a new deadline.
 
 Follow-up input waits for an unload in progress, then reloads the child from saved
 history. Codex does not replay input that the old session already accepted.
 This setting does not change concurrency limits or capacity-driven eviction.
+
+The unload setting works with `features.code_mode` enabled or disabled.
+An active code-mode cell blocks unload only when such a cell exists.
+
+`list_agents` lists loaded runtimes only. It omits children after unload.
+Core's `get_status` returns `NotFound` for an unloaded runtime.
+The child identity remains registered. Core's `inspect_agent` returns
+`AgentInfo::Unloaded`, and follow-up input can reload the child.

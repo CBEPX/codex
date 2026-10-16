@@ -1366,24 +1366,38 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
             .spawn_task(turn, Vec::new(), CompletedAgentUnloadTask::Pending)
             .await;
     }
-    // Keep timer eviction excluded until every test blocker is installed.
-    drop(setup_guard);
-    if !matches!(blocker, CompletedAgentUnloadBlocker::TreeShutdown) {
-        let wait_ms = if matches!(blocker, CompletedAgentUnloadBlocker::BackgroundTerminal) {
-            2200
-        } else {
-            1200
-        };
-        sleep(Duration::from_millis(wait_ms)).await;
-        assert!(
-            harness
-                .manager
-                .get_thread(thread.session.thread_id)
-                .await
-                .is_ok(),
-            "runtime still has an unload blocker"
+    let runtime = &thread.session.services.local_agent_runtime;
+    let expects_attempt = expects_timer
+        && !matches!(
+            blocker,
+            CompletedAgentUnloadBlocker::ResumedTurn | CompletedAgentUnloadBlocker::TreeShutdown
         );
+    if expects_attempt {
+        // Replace any deadline that elapsed while the fixture held its setup pin.
+        runtime.schedule_completed_agent_unload(&thread.session, delay as u64);
     }
+    // No await between arming the fresh deadline and releasing the setup pin.
+    drop(setup_guard);
+    if expects_attempt {
+        timeout(Duration::from_secs(15), async {
+            while runtime.completed_agent_unload_attempts(thread.session.thread_id) == 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the timer must check the installed blocker after setup releases its pin");
+        assert!(runtime.has_completed_agent_unload_timer(thread.session.thread_id));
+    } else if !matches!(blocker, CompletedAgentUnloadBlocker::TreeShutdown) {
+        assert!(!runtime.has_completed_agent_unload_timer(thread.session.thread_id));
+    }
+    assert!(
+        harness
+            .manager
+            .get_thread(thread.session.thread_id)
+            .await
+            .is_ok(),
+        "runtime still has an unload blocker"
+    );
     thread
         .session
         .services
@@ -1391,7 +1405,7 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
         .finish_cell_dispatch(&cell_id);
     drop(elicitation);
     if matches!(blocker, CompletedAgentUnloadBlocker::Elicitation) {
-        timeout(Duration::from_secs(7), async {
+        timeout(Duration::from_secs(15), async {
             while harness
                 .manager
                 .get_thread(thread.session.thread_id)
@@ -1661,18 +1675,20 @@ async fn completed_agent_unload_resume_waits_for_eviction_and_reloads(
         .await;
 }
 
-#[test_case::test_case(CompletedAgentUnloadTask::Completed, 0, false; "completed_zero_code_mode_off")]
-#[test_case::test_case(CompletedAgentUnloadTask::Completed, 2, false; "completed_delayed_code_mode_off")]
-#[test_case::test_case(CompletedAgentUnloadTask::Errored, 0, false; "errored")]
-#[test_case::test_case(CompletedAgentUnloadTask::Interrupted, 0, false; "interrupted")]
-#[test_case::test_case(CompletedAgentUnloadTask::Pending, 0, false; "explicit_interrupt")]
-#[test_case::test_case(CompletedAgentUnloadTask::Completed, 0, true; "completed_zero_code_mode_on")]
-#[test_case::test_case(CompletedAgentUnloadTask::Completed, 2, true; "completed_delayed_code_mode_on")]
+#[test_case::test_case(CompletedAgentUnloadTask::Completed, 0, false, false; "completed_zero_code_mode_off")]
+#[test_case::test_case(CompletedAgentUnloadTask::Completed, 2, false, false; "completed_delayed_code_mode_off")]
+#[test_case::test_case(CompletedAgentUnloadTask::Errored, 0, false, false; "errored")]
+#[test_case::test_case(CompletedAgentUnloadTask::Interrupted, 0, false, false; "interrupted")]
+#[test_case::test_case(CompletedAgentUnloadTask::Pending, 0, false, false; "explicit_interrupt")]
+#[test_case::test_case(CompletedAgentUnloadTask::Completed, 0, true, false; "completed_zero_code_mode_on")]
+#[test_case::test_case(CompletedAgentUnloadTask::Completed, 2, true, false; "completed_delayed_code_mode_on")]
+#[test_case::test_case(CompletedAgentUnloadTask::Completed, 0, false, true; "archived_child_reloaded")]
 #[tokio::test]
 async fn completed_agent_unload_preserves_history_and_root(
     outcome: CompletedAgentUnloadTask,
     delay: i64,
     code_mode: bool,
+    archived: bool,
 ) {
     let (home, mut config) = test_config_with_cli_overrides(vec![(
         "features.multi_agent_v2.completed_agent_unload_delay_secs".to_string(),
@@ -1705,7 +1721,7 @@ async fn completed_agent_unload_preserves_history_and_root(
         .local_agent_runtime
         .control(root.session.session_id());
     let child = spawn_v2_reload_test_child(&control, harness.config.clone(), &root, "worker").await;
-    let thread = harness
+    let mut thread = harness
         .manager
         .get_thread(child.thread_id)
         .await
@@ -1713,7 +1729,54 @@ async fn completed_agent_unload_preserves_history_and_root(
     let history_item = assistant_message("history before unload", Some(MessagePhase::FinalAnswer));
     let environments = thread.environment_selections().await;
     assert!(!environments.is_empty());
-    let setup_guard = persist_completed_agent_unload_fixture(&thread, &history_item).await;
+    let mut setup_guard = persist_completed_agent_unload_fixture(&thread, &history_item).await;
+    if archived {
+        drop(setup_guard);
+        thread
+            .shutdown_and_wait()
+            .await
+            .expect("stop child before archive");
+        harness
+            .manager
+            .remove_thread(&child.thread_id)
+            .await
+            .expect("remove stopped child");
+        control.forget_v2_residency(child.thread_id);
+        let store = LocalThreadStore::new(
+            LocalThreadStoreConfig::from_config(&harness.config),
+            harness.state_db.clone(),
+        );
+        store
+            .archive_thread(ArchiveThreadParams {
+                thread_id: child.thread_id,
+            })
+            .await
+            .expect("archive saved V2 child");
+        setup_guard = control
+            .ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, None)
+            .await
+            .expect("reload archived V2 child through collaboration");
+        let reloaded = harness
+            .manager
+            .get_thread(child.thread_id)
+            .await
+            .expect("archived child is loaded");
+        assert!(!Arc::ptr_eq(&thread, &reloaded));
+        assert_eq!(reloaded.multi_agent_version(), Some(MultiAgentVersion::V2));
+        let stored = store
+            .read_thread(ReadThreadParams {
+                thread_id: child.thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+            .expect("read archived child after reload");
+        assert!(
+            stored.archived_at.is_some(),
+            "collaboration reload must keep archive state"
+        );
+        thread = reloaded;
+    }
     let turn = thread.session.new_default_turn().await;
     thread.session.spawn_task(turn, Vec::new(), outcome).await;
     drop(setup_guard);
