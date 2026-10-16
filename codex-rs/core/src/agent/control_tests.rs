@@ -1052,6 +1052,35 @@ enum CompletedAgentUnloadBlocker {
     ExtremeDelay,
 }
 
+async fn persist_completed_agent_unload_fixture(
+    thread: &Arc<CodexThread>,
+    item: &ResponseItem,
+) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+    let guard = thread
+        .session
+        .services
+        .local_agent_runtime
+        .pin_v2_residency(thread)
+        .await
+        .expect("pin fixture setup");
+    // Injection into an active turn is queued. Replacement discards that queue.
+    thread
+        .session
+        .abort_all_tasks(TurnAbortReason::Replaced)
+        .await;
+    thread
+        .inject_response_items(vec![item.clone()])
+        .await
+        .expect("record fixture history while idle");
+    thread.flush_rollout().await.expect("flush fixture history");
+    let history = thread.session.clone_history().await;
+    assert!(
+        strip_response_item_ids(&history.raw_items().cloned().collect::<Vec<_>>()).contains(item),
+        "fixture history must exist before terminal completion"
+    );
+    guard
+}
+
 #[test_case::test_case(CompletedAgentUnloadBlocker::Disabled; "disabled")]
 #[test_case::test_case(CompletedAgentUnloadBlocker::Root; "root")]
 #[test_case::test_case(CompletedAgentUnloadBlocker::Ephemeral; "ephemeral")]
@@ -1118,15 +1147,15 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
             .await
             .expect("loaded child")
     };
-    if !matches!(blocker, CompletedAgentUnloadBlocker::Ephemeral) {
-        thread
-            .inject_response_items(vec![assistant_message(
-                "saved child history",
-                Some(MessagePhase::FinalAnswer),
-            )])
-            .await
-            .expect("persist history");
-    }
+    let setup_guard = if !matches!(blocker, CompletedAgentUnloadBlocker::Ephemeral) {
+        persist_completed_agent_unload_fixture(
+            &thread,
+            &assistant_message("saved child history", Some(MessagePhase::FinalAnswer)),
+        )
+        .await
+    } else {
+        None
+    };
     if matches!(blocker, CompletedAgentUnloadBlocker::Sleep) {
         thread
             .thread_extension_data()
@@ -1242,6 +1271,8 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
             .spawn_task(turn, Vec::new(), CompletedAgentUnloadTask::Pending)
             .await;
     }
+    // Keep timer eviction excluded until every test blocker is installed.
+    drop(setup_guard);
     if !matches!(blocker, CompletedAgentUnloadBlocker::TreeShutdown) {
         let wait_ms = if matches!(blocker, CompletedAgentUnloadBlocker::BackgroundTerminal) {
             2200
@@ -1264,6 +1295,20 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
         .code_mode_service
         .finish_cell_dispatch(&cell_id);
     drop(elicitation);
+    if matches!(blocker, CompletedAgentUnloadBlocker::Elicitation) {
+        timeout(Duration::from_secs(7), async {
+            while harness
+                .manager
+                .get_thread(thread.session.thread_id)
+                .await
+                .is_ok()
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("clearing an elicitation must let the bounded retry unload the child");
+    }
     let shutdown = harness
         .manager
         .request_agent_tree_shutdown(root_id)
@@ -1275,8 +1320,10 @@ async fn completed_agent_unload_retains_required_runtime(blocker: CompletedAgent
         .expect("tree shutdown succeeds");
 }
 
+#[test_case::test_case(false; "turn_input")]
+#[test_case::test_case(true; "thread_settings")]
 #[tokio::test]
-async fn completed_agent_unload_excludes_direct_turn_input() {
+async fn completed_agent_unload_excludes_direct_turn_input(settings: bool) {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let harness = AgentControlHarness::new_with_config(home, config).await;
@@ -1293,8 +1340,16 @@ async fn completed_agent_unload_excludes_direct_turn_input() {
         .await
         .expect("loaded child");
     let eviction_guard = Arc::clone(&thread.residency_gate).write_owned().await;
-    let mut input =
-        Box::pin(thread.start_or_steer_turn(TurnInputRequest::user_input(text_input("followup"))));
+    let mut input = Box::pin(async {
+        if settings {
+            thread.update_thread_settings(codex_protocol::protocol::ThreadSettingsOverrides::default()).await
+        } else {
+            thread
+                .start_or_steer_turn(TurnInputRequest::user_input(text_input("followup")))
+                .await
+                .map(|_| ())
+        }
+    });
     assert!(
         timeout(Duration::from_millis(50), &mut input)
             .await
@@ -1312,8 +1367,10 @@ async fn completed_agent_unload_excludes_direct_turn_input() {
         .await;
 }
 
+#[test_case::test_case(false; "resume")]
+#[test_case::test_case(true; "queue_only_caller_without_unload")]
 #[tokio::test]
-async fn completed_agent_unload_resume_waits_for_eviction_and_reloads() {
+async fn completed_agent_unload_resume_waits_for_eviction_and_reloads(queue_only: bool) {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
@@ -1324,24 +1381,47 @@ async fn completed_agent_unload_resume_waits_for_eviction_and_reloads() {
         .services
         .local_agent_runtime
         .control(root.session.session_id());
-    let child = spawn_v2_reload_test_child(&control, harness.config.clone(), &root, "worker").await;
+    let mut child_config = harness.config.clone();
+    child_config
+        .multi_agent_v2
+        .completed_agent_unload_delay_secs = Some(60);
+    let child = spawn_v2_reload_test_child(&control, child_config, &root, "worker").await;
     let thread = harness
         .manager
         .get_thread(child.thread_id)
         .await
         .expect("loaded child");
-    thread
-        .inject_response_items(vec![assistant_message(
-            "persisted child",
-            Some(MessagePhase::FinalAnswer),
-        )])
-        .await
-        .expect("persist history");
+    drop(
+        persist_completed_agent_unload_fixture(
+            &thread,
+            &assistant_message("persisted child", Some(MessagePhase::FinalAnswer)),
+        )
+        .await,
+    );
 
     // Hold the same exclusion gate as eviction while a resume observes the old runtime.
     let eviction_guard = Arc::clone(&thread.residency_gate).write_owned().await;
-    let mut resume =
-        Box::pin(control.ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, None));
+    let mut resume = Box::pin(async {
+        if queue_only {
+            control
+                .send(crate::SendRequest {
+                    caller: root.session.thread_id,
+                    target: crate::AgentTarget::Id(child.thread_id),
+                    resume_config: harness.config.clone(),
+                    input: AgentInput::Message {
+                        message: AgentMessage::Plaintext("delivered once".into()),
+                        mode: MessageDeliveryMode::QueueOnly,
+                    },
+                    start_options: Default::default(),
+                })
+                .await
+                .map(|_| ())
+        } else {
+            control
+                .ensure_v2_agent_loaded(harness.config.clone(), child.thread_id, None)
+                .await
+        }
+    });
     assert!(
         timeout(Duration::from_millis(50), &mut resume)
             .await
@@ -1363,12 +1443,26 @@ async fn completed_agent_unload_resume_waits_for_eviction_and_reloads() {
         .await
         .expect("resume completes")
         .expect("resume reloads after lost pin");
-    let reloaded = harness
-        .manager
-        .get_thread(child.thread_id)
-        .await
-        .expect("resume must publish a runtime");
-    assert!(!Arc::ptr_eq(&thread, &reloaded));
+    if queue_only {
+        assert!(harness.manager.get_thread(child.thread_id).await.is_err());
+        assert_eq!(
+            control.take_mailbox(child.thread_id),
+            vec![InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::try_from("/root/worker").expect("agent path"),
+                Vec::new(),
+                "delivered once".into(),
+                false
+            )]
+        );
+    } else {
+        let reloaded = harness
+            .manager
+            .get_thread(child.thread_id)
+            .await
+            .expect("resume must publish a runtime");
+        assert!(!Arc::ptr_eq(&thread, &reloaded));
+    }
     harness
         .manager
         .shutdown_all_threads_bounded(Duration::from_secs(10))
@@ -1418,12 +1512,10 @@ async fn completed_agent_unload_preserves_history_and_root(
     let history_item = assistant_message("history before unload", Some(MessagePhase::FinalAnswer));
     let environments = thread.environment_selections().await;
     assert!(!environments.is_empty());
-    thread
-        .inject_response_items(vec![history_item.clone()])
-        .await
-        .expect("persist child history");
+    let setup_guard = persist_completed_agent_unload_fixture(&thread, &history_item).await;
     let turn = thread.session.new_default_turn().await;
     thread.session.spawn_task(turn, Vec::new(), outcome).await;
+    drop(setup_guard);
     if matches!(outcome, CompletedAgentUnloadTask::Pending) {
         thread
             .session
