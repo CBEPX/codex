@@ -256,7 +256,7 @@ impl CodexThread {
     }
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
-        self.io.submit(op).await
+        self.submit_with_trace(op, None).await
     }
 
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
@@ -401,10 +401,22 @@ impl CodexThread {
         op: Op,
         trace: Option<W3cTraceContext>,
     ) -> CodexResult<String> {
+        let residency_guard = if matches!(op, Op::Shutdown) {
+            None
+        } else {
+            self.session
+                .services
+                .local_agent_runtime
+                .pin_v2_residency(self)
+                .await?
+        };
         self.io
             .submit_with_trace(
-                op, trace, /*parent_turn_id*/ None, /*root_turn_id*/ None,
-                /*residency_guard*/ None,
+                op,
+                trace,
+                /*parent_turn_id*/ None,
+                /*root_turn_id*/ None,
+                residency_guard,
             )
             .await
     }
@@ -475,6 +487,12 @@ impl CodexThread {
         &self,
         request: impl Into<WithTurnExtensionData<RecoverTurnRequest>>,
     ) -> CodexResult<StartIfIdleSubmission> {
+        let _residency_guard = self
+            .session
+            .services
+            .local_agent_runtime
+            .pin_v2_residency(self)
+            .await?;
         self.ensure_execution_capacity_for_turn_start(self.session.services.agent_control.as_ref())
             .await?;
         let WithTurnExtensionData {
@@ -588,6 +606,12 @@ impl CodexThread {
         request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
         mode: TurnInputMode,
     ) -> CodexResult<TurnInputSubmission> {
+        let _residency_guard = self
+            .session
+            .services
+            .local_agent_runtime
+            .pin_v2_residency(self)
+            .await?;
         if !matches!(mode, TurnInputMode::Steer { .. }) {
             self.ensure_execution_capacity_for_turn_start(
                 self.session.services.agent_control.as_ref(),
@@ -686,6 +710,12 @@ impl CodexThread {
         &self,
         thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
     ) -> CodexResult<()> {
+        let _residency_guard = self
+            .session
+            .services
+            .local_agent_runtime
+            .pin_v2_residency(self)
+            .await?;
         let (reply, result) = oneshot::channel();
         let WithTurnExtensionData {
             request: thread_settings,

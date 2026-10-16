@@ -157,7 +157,7 @@ fn retain_forked_developer_message(item: &mut ResponseItem, usage_hint_texts: &[
     !content.is_empty() && set_annotated_content(item, content).is_some()
 }
 
-async fn load_agent_model_context(
+pub(super) async fn load_agent_model_context(
     state: &ThreadManagerState,
     thread_id: ThreadId,
     history_mode: ThreadHistoryMode,
@@ -342,9 +342,9 @@ impl LocalAgentControl {
             }
         }
         if owner_thread_id.is_none()
-            && let Ok(thread) = state.get_thread(thread_id).await
+            && let Ok(pin) = self.touch_loaded_v2_residency(&state, thread_id).await
         {
-            return self.runtime.pin_v2_residency(&state, &thread).await;
+            return Ok(pin);
         }
         if self
             .runtime
@@ -397,7 +397,9 @@ impl LocalAgentControl {
             }
             if let Ok(thread) = state.get_thread(thread_id).await {
                 self.validate_loaded_v2_child(&thread, parent_thread_id)?;
-                return self.runtime.pin_v2_residency(&state, &thread).await;
+                if let Ok(pin) = self.touch_loaded_v2_residency(&state, thread_id).await {
+                    return Ok(pin);
+                }
             }
         }
         let parent = if let Some(parent) = parent {
@@ -631,9 +633,7 @@ impl LocalAgentControl {
                 // Finish registration even if the sender is cancelled while acquiring its pin.
                 tokio::spawn(async move {
                     let _membership = membership;
-                    let residency_pin = runtime
-                        .pin_v2_residency(&state, &reloaded_thread.thread)
-                        .await?;
+                    let residency_pin = runtime.pin_v2_residency(&reloaded_thread.thread).await?;
                     runtime.registry.clear_evicted_environments(thread_id);
                     residency_slot.commit(reloaded_thread.thread_id);
                     // Register before listeners can forward events from the resumed thread.
@@ -666,7 +666,7 @@ impl LocalAgentControl {
                     }
                     self.runtime.registry.clear_evicted_environments(thread_id);
                     drop(residency_slot);
-                    return self.runtime.pin_v2_residency(&state, &thread).await;
+                    return self.touch_loaded_v2_residency(&state, thread_id).await;
                 }
                 Err(err)
             }

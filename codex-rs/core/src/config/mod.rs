@@ -1368,6 +1368,7 @@ impl Default for CurrentTimeReminderConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MultiAgentV2Config {
     pub max_concurrent_threads_per_session: usize,
+    pub completed_agent_unload_delay_secs: Option<u64>,
     pub min_wait_timeout_ms: i64,
     pub max_wait_timeout_ms: i64,
     pub default_wait_timeout_ms: i64,
@@ -1392,6 +1393,7 @@ impl MultiAgentV2Config {
     fn defaults_for_max_concurrency(max_concurrent_threads_per_session: usize) -> Self {
         Self {
             max_concurrent_threads_per_session,
+            completed_agent_unload_delay_secs: None,
             min_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS,
             max_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS,
             default_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS,
@@ -2881,6 +2883,8 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
 
     MultiAgentV2Config {
         max_concurrent_threads_per_session,
+        completed_agent_unload_delay_secs: base
+            .and_then(|config| config.completed_agent_unload_delay_secs),
         min_wait_timeout_ms,
         max_wait_timeout_ms,
         default_wait_timeout_ms,
